@@ -1,6 +1,25 @@
 import AppKit
+import FluidAudio
 
+// Test hook: `LuisCanSpeak --transcribe-file <audio>` prints what Parakeet
+// hears in an audio file, then exits. It doesn't start the menu bar app.
 let args = CommandLine.arguments
+if let i = args.firstIndex(of: "--transcribe-file"), i + 1 < args.count {
+    let url = URL(fileURLWithPath: args[i + 1])
+    Task { @MainActor in
+        do {
+            let samples = try AudioConverter().resampleAudioFile(url)
+            let started = Date()
+            let text = try await ParakeetEngine.shared.transcribe(samples)
+            print(String(format: "[%.2fs] ", Date().timeIntervalSince(started)) + text)
+            exit(0)
+        } catch {
+            print("error: \(error)")
+            exit(1)
+        }
+    }
+    RunLoop.main.run()
+}
 
 // Test hook: `open -n "Luis Can Speak.app" --args --probe-speech <in.txt> <out.txt>`
 // speaks each line of in.txt almost silently with the saved voice and

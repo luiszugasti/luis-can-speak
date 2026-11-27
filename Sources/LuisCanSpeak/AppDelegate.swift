@@ -69,6 +69,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         speaker.setUp { [weak self] in self?.checkPitch() }
 
+        dictation.onError = { [weak self] message in
+            MainActor.assumeIsolated { self?.fail(message) }
+        }
+        if Dictation.engineChoice == .parakeet { preloadParakeet() }
+
         dictation.onPartial = { [weak self] text in
             MainActor.assumeIsolated { self?.statusItem.button?.toolTip = text }
         }
@@ -536,7 +541,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if !lastReply.isEmpty { action("Read the last reply again", #selector(replayLastReply)) }
 
         menu.addItem(.separator())
-        let languageItem = NSMenuItem(title: "Dictation language", action: nil, keyEquivalent: "")
+        let engineItem = NSMenuItem(title: "Speech-to-text: \(Dictation.engineChoice == .apple ? "Apple" : "Parakeet")", action: nil, keyEquivalent: "")
+        let engineMenu = NSMenu()
+        for (index, engine) in Dictation.Engine.allCases.enumerated() {
+            let item = NSMenuItem(title: engine.menuName, action: #selector(pickEngine(_:)), keyEquivalent: "")
+            item.target = self
+            item.tag = index
+            item.state = engine == Dictation.engineChoice ? .on : .off
+            engineMenu.addItem(item)
+        }
+        engineItem.submenu = engineMenu
+        menu.addItem(engineItem)
+        if Dictation.engineChoice == .parakeet {
+            info(ParakeetEngine.shared.menuStatus)
+            info("Parakeet hears English and Spanish on its own")
+        }
+
+        let appleOnly = Dictation.engineChoice == .apple ? "" : " (Apple only)"
+        let languageItem = NSMenuItem(title: "Dictation language" + appleOnly, action: nil, keyEquivalent: "")
         let languageMenu = NSMenu()
         for (index, language) in Dictation.languages.enumerated() {
             let item = NSMenuItem(title: language.name, action: #selector(pickLanguage(_:)), keyEquivalent: "")
@@ -547,7 +569,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         languageItem.submenu = languageMenu
         menu.addItem(languageItem)
-        action("Edit custom words…", #selector(editCustomWords))
+        action("Edit custom words…" + appleOnly, #selector(editCustomWords))
 
         menu.addItem(.separator())
         let login = SMAppService.mainApp.status
@@ -563,6 +585,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     /// Kept alive while the menu is open, since each row is its slider's target.
     private var sliderRows: [SliderRow] = []
+
+    @objc private func pickEngine(_ sender: NSMenuItem) {
+        let engine = Dictation.Engine.allCases[sender.tag]
+        Dictation.engineChoice = engine
+        if engine == .parakeet { preloadParakeet() }
+    }
+
+    /// Downloads and loads Parakeet in the background, so it's ready when you talk.
+    private func preloadParakeet() {
+        Task {
+            do {
+                try await ParakeetEngine.shared.load()
+                NSSound(named: "Glass")?.play()
+            } catch {
+                self.lastError = "Parakeet failed to load: \(error.localizedDescription)"
+            }
+        }
+    }
 
     @objc private func pickLanguage(_ sender: NSMenuItem) {
         Dictation.languageID = Dictation.languages[sender.tag].id
