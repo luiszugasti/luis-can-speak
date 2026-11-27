@@ -53,8 +53,24 @@ final class Dictation {
         }
     }
 
+    /// The languages you can dictate in, as (locale id, menu name).
+    static let languages: [(id: String, name: String)] = [
+        ("en-US", "English (US)"),
+        ("es-US", "Español (Estados Unidos)"),
+        ("es-MX", "Español (México)"),
+        ("es-ES", "Español (España)"),
+    ]
+
+    private static let languageKey = "dictationLanguage"
+
+    /// The language you picked in the menu. English (US) until you pick one.
+    static var languageID: String {
+        get { UserDefaults.standard.string(forKey: languageKey) ?? "en-US" }
+        set { UserDefaults.standard.set(newValue, forKey: languageKey) }
+    }
+
     private static func locale() async throws -> Locale {
-        if let l = await SpeechTranscriber.supportedLocale(equivalentTo: Locale.current) { return l }
+        if let l = await SpeechTranscriber.supportedLocale(equivalentTo: Locale(identifier: languageID)) { return l }
         if let l = await SpeechTranscriber.supportedLocale(equivalentTo: Locale(identifier: "en-US")) { return l }
         throw DictationError.localeUnsupported
     }
@@ -70,6 +86,9 @@ final class Dictation {
             try await request.downloadAndInstall()
         }
         let analyzer = SpeechAnalyzer(modules: [transcriber])
+        let context = AnalysisContext()
+        context.contextualStrings[.general] = CustomWords.load()
+        try await analyzer.setContext(context)
         guard let analyzerFormat = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [transcriber]) else {
             throw DictationError.noAudioFormat
         }

@@ -1,5 +1,6 @@
 import AppKit
 import Carbon
+import ServiceManagement
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
@@ -66,7 +67,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         speaker.onFinished = { [weak self] in
             MainActor.assumeIsolated { self?.speechFinished() }
         }
-        speaker.setUp {}
+        speaker.setUp { [weak self] in self?.checkPitch() }
 
         dictation.onPartial = { [weak self] text in
             MainActor.assumeIsolated { self?.statusItem.button?.toolTip = text }
@@ -84,6 +85,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         Task {
             do { try await Dictation.prepareModel() } catch { self.lastError = error.localizedDescription }
         }
+
+        CustomWords.ensureFile()
+        setUpLoginAndGreeting()
     }
 
     // MARK: Hotkey
@@ -187,6 +191,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let shouldRead = voiceTurnActive || readEveryReply
             voiceTurnActive = false
             dropAllPending()
+            if let text = body["last_assistant_message"] as? String {
+                lastReply = text
+                SpeechLog.write("STOP HOOK: reply is \(text.count) chars")
+            }
             if shouldRead, let text = body["last_assistant_message"] as? String, !text.isEmpty {
                 say(text, isPrompt: false)
             } else if mode == .waitingForClaude {
@@ -471,10 +479,192 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         menu.addItem(.separator())
         action("Read every reply in the linked session", #selector(toggleReadEveryReply), on: readEveryReply)
-        info("Voice: \(speaker.voiceDescription)")
+        let voiceItem = NSMenuItem(title: "Voice: \(speaker.voiceDescription)", action: nil, keyEquivalent: "")
+        let voiceMenu = NSMenu()
+        if speaker.personalVoiceStatus != .authorized {
+            let note = NSMenuItem(title: "Personal Voice isn't allowed. Turn it on in System Settings > Privacy & Security > Personal Voice.", action: nil, keyEquivalent: "")
+            note.isEnabled = false
+            voiceMenu.addItem(note)
+            voiceMenu.addItem(.separator())
+        }
+        for v in speaker.availableVoices {
+            let personal = v.voiceTraits.contains(.isPersonalVoice)
+            let item = NSMenuItem(title: personal ? "\(v.name) (Personal Voice)" : v.name, action: #selector(pickVoice(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = v.identifier
+            item.state = v.identifier == speaker.currentVoiceIdentifier ? .on : .off
+            voiceMenu.addItem(item)
+        }
+        voiceItem.submenu = voiceMenu
+        menu.addItem(voiceItem)
+        sliderRows = [
+            SliderRow(
+                value: speaker.speed, range: 0.5...2.0, steps: 7,
+                format: { "Speed: " + String(format: "%g", $0) + "×" + ($0 == 1 ? " (normal)" : "") },
+                onChange: { [weak self] in self?.speaker.speed = $0 },
+                onRelease: { [weak self] in self?.testVoice() }
+            ),
+            SliderRow(
+                value: speaker.pitchWorks ? speaker.pitch : 1.0, range: 0.5...2.0, steps: 7,
+                enabled: speaker.pitchWorks,
+                toolTip: speaker.pitchWorks ? nil
+                    : (speaker.currentVoice?.voiceTraits.contains(.isPersonalVoice) ?? false)
+                        ? "Personal Voice ignores pitch changes. macOS also keeps apps from recording Personal Voice, so the app can't measure it. Pick a built-in Apple voice to change pitch."
+                        : "This voice ignores pitch changes. The app tested it at low and high pitch, and it sounded the same both times.",
+                format: { [weak self] value in
+                    guard self?.speaker.pitchWorks ?? true else { return "Pitch: this voice can't change it" }
+                    return "Pitch: " + String(format: "%g", value) + "×" + (value == 1 ? " (normal)" : "")
+                },
+                onChange: { [weak self] in self?.speaker.pitch = $0 },
+                onRelease: { [weak self] in self?.testVoice() }
+            ),
+            SliderRow(
+                value: speaker.volume, range: 0...1, steps: 11,
+                format: { "Volume: \(Int(($0 * 100).rounded()))%" },
+                onChange: { [weak self] in self?.speaker.volume = $0 },
+                onRelease: { [weak self] in self?.testVoice() }
+            ),
+            SliderRow(
+                value: speaker.pause, range: 0...3, steps: 13,
+                format: { $0 == 0 ? "Pause before talking: none" : "Pause before talking: " + String(format: "%g", $0) + " s" },
+                onChange: { [weak self] in self?.speaker.pause = $0 },
+                onRelease: {}
+            ),
+        ]
+        for row in sliderRows { menu.addItem(row.item) }
+        action("Test the voice", #selector(testVoice))
+        if !lastReply.isEmpty { action("Read the last reply again", #selector(replayLastReply)) }
+
+        menu.addItem(.separator())
+        let languageItem = NSMenuItem(title: "Dictation language", action: nil, keyEquivalent: "")
+        let languageMenu = NSMenu()
+        for (index, language) in Dictation.languages.enumerated() {
+            let item = NSMenuItem(title: language.name, action: #selector(pickLanguage(_:)), keyEquivalent: "")
+            item.target = self
+            item.tag = index
+            item.state = language.id == Dictation.languageID ? .on : .off
+            languageMenu.addItem(item)
+        }
+        languageItem.submenu = languageMenu
+        menu.addItem(languageItem)
+        action("Edit custom words…", #selector(editCustomWords))
+
+        menu.addItem(.separator())
+        let login = SMAppService.mainApp.status
+        action("Open at login", #selector(toggleOpenAtLogin), on: login == .enabled)
+        if login == .requiresApproval {
+            info("Allow it in System Settings > General > Login Items")
+        }
+        action("Greet me when I unlock the Mac", #selector(toggleGreeting), on: greetOnUnlock)
         menu.addItem(.separator())
         let quit = NSMenuItem(title: "Quit Luis Can Speak", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         menu.addItem(quit)
+    }
+
+    /// Kept alive while the menu is open, since each row is its slider's target.
+    private var sliderRows: [SliderRow] = []
+
+    @objc private func pickLanguage(_ sender: NSMenuItem) {
+        Dictation.languageID = Dictation.languages[sender.tag].id
+        // Download the speech model for the new language now, so the next
+        // recording doesn't wait for it.
+        Task {
+            do { try await Dictation.prepareModel() } catch { self.lastError = error.localizedDescription }
+        }
+    }
+
+    @objc private func editCustomWords() {
+        CustomWords.ensureFile()
+        NSWorkspace.shared.open(CustomWords.fileURL)
+    }
+
+    // MARK: Login and unlock
+
+    private var greetOnUnlock: Bool {
+        get { defaults.object(forKey: "greetOnUnlock") as? Bool ?? true }
+        set { defaults.set(newValue, forKey: "greetOnUnlock") }
+    }
+
+    /// Turns on "Open at login" the first time the app runs. After that, the
+    /// menu toggle decides.
+    private func setUpLoginAndGreeting() {
+        if !defaults.bool(forKey: "loginItemSetUp") {
+            defaults.set(true, forKey: "loginItemSetUp")
+            do { try SMAppService.mainApp.register() } catch { lastError = "Couldn't turn on Open at login: \(error.localizedDescription)" }
+        }
+        DistributedNotificationCenter.default().addObserver(
+            forName: NSNotification.Name("com.apple.screenIsUnlocked"), object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.greet() }
+        }
+    }
+
+    private func greet() {
+        guard greetOnUnlock, mode == .idle else { return }
+        let hour = Calendar.current.component(.hour, from: Date())
+        let part = hour < 12 ? "Good morning" : hour < 18 ? "Good afternoon" : "Good evening"
+        let name = NSFullUserName().split(separator: " ").first.map(String.init) ?? ""
+        let spanish = Dictation.languageID.hasPrefix("es")
+        let greeting: String
+        if spanish {
+            let parte = hour < 12 ? "Buenos días" : hour < 18 ? "Buenas tardes" : "Buenas noches"
+            greeting = "\(parte), \(name). Bienvenido de vuelta."
+        } else {
+            greeting = "\(part), \(name). Welcome back."
+        }
+        say(greeting, isPrompt: false)
+    }
+
+    @objc private func toggleOpenAtLogin() {
+        do {
+            if SMAppService.mainApp.status == .enabled {
+                try SMAppService.mainApp.unregister()
+            } else {
+                try SMAppService.mainApp.register()
+            }
+        } catch {
+            lastError = "Couldn't change Open at login: \(error.localizedDescription)"
+        }
+    }
+
+    @objc private func toggleGreeting() {
+        greetOnUnlock.toggle()
+    }
+
+    /// Tests the current voice for pitch support in the background. Until the
+    /// test finishes, the slider stays on.
+    private func checkPitch() {
+        guard let voice = speaker.currentVoice else { return }
+        if let known = PitchProbe.cached(voice) {
+            speaker.pitchWorks = known
+            return
+        }
+        speaker.pitchWorks = true
+        Task {
+            let works = await PitchProbe.supportsPitch(voice)
+            if self.speaker.currentVoice?.identifier == voice.identifier {
+                self.speaker.pitchWorks = works
+            }
+        }
+    }
+
+    @objc private func pickVoice(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String else { return }
+        speaker.selectVoice(identifier: id)
+        checkPitch()
+        testVoice()
+    }
+
+    private var lastReply = ""
+
+    @objc private func replayLastReply() {
+        if mode == .speaking { speaker.stop() }
+        say(lastReply, isPrompt: false)
+    }
+
+    @objc private func testVoice() {
+        if mode == .speaking { speaker.stop() }
+        say("Hi, this is Luis Can Speak. This is how I'll read Claude's replies to you.", isPrompt: false)
     }
 
     @objc private func relink() {
